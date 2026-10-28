@@ -1,0 +1,86 @@
+name: final-project
+services:
+  nginx:
+    image: nginx:1.27.5-alpine3.21
+    container_name: final-project-nginx
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8088}:8080"
+    mem_limit: "${NGINX_MEMORY_MB:-128}m"
+    cpus: "${NGINX_CPUS:-0.5}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/nginx-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.3
+    container_name: final-project-elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms${ES_HEAP_MB:-768}m -Xmx${ES_HEAP_MB:-768}m
+    mem_limit: "${ES_MEMORY_MB:-2048}m"
+    cpus: "${ES_CPUS:-2}"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "127.0.0.1:${ES_PORT:-19200}:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 8 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.17.3
+    container_name: final-project-logstash
+    restart: unless-stopped
+    environment:
+      - LS_JAVA_OPTS=-Xms${LOGSTASH_HEAP_MB:-384}m -Xmx${LOGSTASH_HEAP_MB:-384}m
+    mem_limit: "${LOGSTASH_MEMORY_MB:-1024}m"
+    cpus: "${LOGSTASH_CPUS:-1}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9600/_node/stats/pipelines/main | grep -q \"plugins\""]
+      start_period: 90s
+      interval: 15s
+      timeout: 10s
+      retries: 12
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.17.3
+    container_name: final-project-kibana
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - XPACK_SECURITY_ENABLED=false
+      - NODE_OPTIONS=--max-old-space-size=${KIBANA_HEAP_MB:-768}
+    volumes:
+      - ./kibana/healthcheck.sh:/usr/share/kibana/config/final-project-healthcheck.sh:ro
+    mem_limit: "${KIBANA_MEMORY_MB:-1400}m"
+    cpus: "${KIBANA_CPUS:-1}"
+    healthcheck:
+      test: ["CMD", "/bin/bash", "/usr/share/kibana/config/final-project-healthcheck.sh"]
+      start_period: 90s
+      interval: 20s
+      timeout: 10s
+      retries: 15
+    ports:
+      - "127.0.0.1:${KIBANA_PORT:-5601}:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+volumes:
+  esdata:

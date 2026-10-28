@@ -1,0 +1,170 @@
+---
+- name: Deploy Final Project locally
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Wait for Kibana to become healthy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ lookup('ansible.builtin.env', 'KIBANA_PORT') }}/api/status"
+        return_content: true
+        timeout: 10
+        use_proxy: false
+      register: kibana_health
+      until: >-
+        kibana_health.status == 200 and
+        (kibana_health.json | default({})).get('status', {}).get('overall', {}).get('level', '') == 'available'
+      retries: 30
+      delay: 5
+
+    - name: Read Kibana Data Views
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ lookup('ansible.builtin.env', 'KIBANA_PORT') }}/api/data_views"
+        return_content: true
+        timeout: 15
+        use_proxy: false
+      register: kibana_views
+
+    - name: Find the project logs Data View
+      ansible.builtin.set_fact:
+        project_log_views: "{{ kibana_views.json.data_view | selectattr('title', 'equalto', 'final-project-logs-*') | list }}"
+
+    - name: Read the existing project logs Data View settings
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ lookup('ansible.builtin.env', 'KIBANA_PORT') }}/api/data_views/data_view/{{ project_log_views[0].id | urlencode }}"
+        return_content: true
+        timeout: 15
+        use_proxy: false
+      register: project_log_view
+      when: project_log_views | length > 0
+
+    - name: Create or configure the project logs Data View
+      ansible.builtin.uri:
+        url: >-
+          http://127.0.0.1:{{ lookup('ansible.builtin.env', 'KIBANA_PORT') }}/api/data_views/data_view{{ '/' ~ (project_log_views[0].id | urlencode) if project_log_views | length > 0 else '' }}
+        method: POST
+        headers:
+          kbn-xsrf: final-project
+        body_format: json
+        body:
+          data_view: >-
+            {{ {'name': 'DevOps Project Logs', 'title': 'final-project-logs-*',
+                'timeFieldName': '@timestamp', 'allowNoIndex': true}
+               | combine({} if project_log_views | length > 0 else {'id': 'final-project-logs'}) }}
+        timeout: 30
+        use_proxy: false
+      when: >-
+        project_log_views | length == 0 or
+        project_log_view.json.data_view.get('name', '') != 'DevOps Project Logs' or
+        project_log_view.json.data_view.get('timeFieldName', '') != '@timestamp'
+      changed_when: true
+
+    - name: Check for existing cluster
+      ansible.builtin.command: k3d cluster list -o json
+      register: cluster_list
+      changed_when: false
+
+    - name: Find the project cluster
+      ansible.builtin.set_fact:
+        project_clusters: "{{ cluster_list.stdout | from_json | selectattr('name', 'equalto', 'final-project') | list }}"
+
+    # Node memory flags create meminfo bind sources inside the temporary
+    # controller, where the host Docker daemon cannot access them.
+    - name: Create the K3s cluster
+      ansible.builtin.command: >-
+        k3d cluster create final-project --servers 1 --agents 2
+        --image rancher/k3s:v1.31.7-k3s1
+        --network final-project_default
+        --api-port 127.0.0.1:{{ lookup('ansible.builtin.env', 'API_PORT') }}
+        --port 127.0.0.1:{{ lookup('ansible.builtin.env', 'NODE_PORT') }}:30080@server:0
+        --k3s-arg --disable=traefik@server:0
+        --kubeconfig-update-default=false
+        --kubeconfig-switch-context=false
+        --wait --timeout 240s
+      when: project_clusters | length == 0
+
+    - name: Verify cluster shape and save project credentials
+      ansible.builtin.command: bash scripts/cluster.sh refresh
+      args:
+        chdir: "{{ playbook_dir }}/.."
+      changed_when: false
+
+    - name: Wait for all three nodes
+      ansible.builtin.command: >-
+        kubectl --context k3d-final-project wait nodes --all
+        --for=condition=Ready --timeout=240s
+      changed_when: false
+
+    - name: Check Kubernetes node roles
+      ansible.builtin.command: kubectl --context k3d-final-project get nodes -o json
+      register: cluster_nodes
+      changed_when: false
+
+    - name: Read control plane nodes
+      ansible.builtin.command: >-
+        kubectl --context k3d-final-project get nodes
+        -l node-role.kubernetes.io/control-plane -o name
+      register: server_nodes
+      changed_when: false
+
+    - name: Require one server and two workers in Kubernetes
+      ansible.builtin.assert:
+        that:
+          - (cluster_nodes.stdout | from_json)['items'] | length == 3
+          - server_nodes.stdout_lines | length == 1
+        fail_msg: Expected 1 server and 2 workers; refusing automatic cluster changes.
+
+    - name: Apply app resources without resetting its working release
+      ansible.builtin.command: bash scripts/release.sh deploy
+      args:
+        chdir: "{{ playbook_dir }}/.."
+      changed_when: true
+
+    - name: Inspect project Logstash address
+      ansible.builtin.command: docker inspect final-project-logstash
+      register: logstash_container
+      changed_when: false
+
+    - name: Set Logstash address on the shared Docker network
+      ansible.builtin.set_fact:
+        logstash_ip: "{{ (logstash_container.stdout | from_json)[0].NetworkSettings.Networks['final-project_default'].IPAddress }}"
+
+    - name: Check Logstash address and owner
+      ansible.builtin.assert:
+        that:
+          - logstash_ip | length > 0
+          - (logstash_container.stdout | from_json)[0].Config.Labels['com.docker.compose.project'] == 'final-project'
+
+    - name: Install log collector and its Kubernetes Service
+      ansible.builtin.command:
+        argv: [kubectl, --context, k3d-final-project, apply, -f, '-']
+        stdin: "{{ lookup('ansible.builtin.pipe', 'python3 ' ~ ((playbook_dir ~ '/../scripts/render-app.py') | quote) ~ ' --fluent-bit') }}"
+      changed_when: true
+
+    - name: Connect the Service to the Docker Logstash address
+      ansible.builtin.command:
+        argv: [kubectl, --context, k3d-final-project, apply, -f, '-']
+        stdin: "{{ lookup('ansible.builtin.template', '../k3s/logstash-endpoint.yaml.j2') }}"
+      changed_when: true
+
+    - name: Restart collectors only when configuration changes
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --context
+          - k3d-final-project
+          - -n
+          - final-project
+          - patch
+          - daemonset
+          - fluent-bit
+          - --type=merge
+          - -p
+          - "{{ {'spec': {'template': {'metadata': {'annotations': {'final-project.io/config-hash': lookup('ansible.builtin.file', '../k3s/fluent-bit.yaml') | hash('sha256')}}}}} | to_json }}"
+      changed_when: true
+
+    - name: Wait for log collectors
+      ansible.builtin.command: >-
+        kubectl --context k3d-final-project -n final-project
+        rollout status daemonset/fluent-bit --timeout=240s
+      changed_when: false

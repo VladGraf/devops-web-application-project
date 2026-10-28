@@ -1,0 +1,17 @@
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: logstash-docker
+  namespace: final-project
+  labels:
+    kubernetes.io/service-name: logstash
+    endpointslice.kubernetes.io/managed-by: final-project
+addressType: IPv4
+ports:
+  - name: logs
+    protocol: TCP
+    port: 5000
+endpoints:
+  - addresses: ["{{ logstash_ip }}"]
+    conditions:
+      ready: true

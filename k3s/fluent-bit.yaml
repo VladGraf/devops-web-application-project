@@ -1,0 +1,132 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: final-project
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: final-project
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         2
+        Log_Level     info
+        Parsers_File  parsers.conf
+        HTTP_Server   On
+        HTTP_Listen   0.0.0.0
+        HTTP_Port     2020
+        Health_Check  On
+        HC_Errors_Count 5
+        HC_Retry_Failure_Count 5
+        HC_Period     30
+        storage.path  /var/lib/fluent-bit/buffer
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/*final-project*.log
+        Tag               kube.*
+        Parser            cri
+        # Avoid shared per-user inotify instance limits in nested K3s.
+        Inotify_Watcher   False
+        Exclude_Path      /var/log/containers/fluent-bit-*.log
+        DB                /var/lib/fluent-bit/flb-state.db
+        Read_from_Head     On
+        storage.type      filesystem
+        Mem_Buf_Limit     5MB
+        Skip_Long_Lines   On
+        Refresh_Interval  5
+    [OUTPUT]
+        Name              tcp
+        Match             *
+        Host              logstash.final-project.svc.cluster.local
+        Port              5000
+        Format            json_lines
+        Retry_Limit       False
+        storage.total_limit_size 128M
+  parsers.conf: |
+    [PARSER]
+        Name        cri
+        Format      regex
+        Regex       ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]+) (?<log>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: final-project
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      serviceAccountName: fluent-bit
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.2.10
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: monitoring
+              containerPort: 2020
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: monitoring
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: monitoring
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 100Mi}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/fluent-bit
+            - name: config
+              mountPath: /fluent-bit/etc/
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+          command: ["/fluent-bit/bin/fluent-bit"]
+          args: ["-c", "/fluent-bit/etc/fluent-bit.conf"]
+      volumes:
+        - name: state
+          hostPath:
+            path: /var/lib/final-project/fluent-bit
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: fluent-bit-config
+        - name: varlog
+          hostPath:
+            path: /var/log
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logstash
+  namespace: final-project
+spec:
+  ports:
+    - name: logs
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
